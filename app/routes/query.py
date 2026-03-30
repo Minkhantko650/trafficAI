@@ -27,9 +27,10 @@ _ROUTE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Matches "route to X", "directions to X", "navigate to X", "take me to X"
+# Matches "route to X", "directions to X", "navigate to X", "take me to X",
+# "what abt to X", "what about to X", "get to X", "going to X", "head to X", "travel to X"
 _ROUTE_TO_RE = re.compile(
-    r'(?:route|directions?|navigate|take me|go)\s+to\s+(.+?)(?:\s+avoiding\s+(.+?))?(?:\s*[?!.])?$',
+    r'(?:route|directions?|navigate|take me|go|get|going|head|travel|what\s+a(?:bt|bout)|how\s+(?:long|far|do\s+i\s+get))\s+to\s+(.+?)(?:\s+avoiding\s+(.+?))?(?:\s*[?!.])?$',
     re.IGNORECASE,
 )
 
@@ -389,6 +390,8 @@ async def query_traffic(
                 lat, lon = DEFAULT_LAT, DEFAULT_LON
                 is_generic = True
                 print(f"[query] No road found in query, using all-roads overview")
+                # Flag that the specific road in the query wasn't found
+                request.question = request.question + "\n\n[SYSTEM NOTE: The road/location mentioned above was NOT found in the Bangkok traffic database. Do not use any road name from the user's question. If asked about a specific road, say it was not found in the system.]"
 
     try:
         incidents_data = await get_traffic_incidents(lat, lon)
