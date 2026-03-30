@@ -198,9 +198,7 @@ def format_incidents_for_context(incidents_data: dict) -> str:
 
 async def geocode_place(name: str) -> tuple:
     """Geocode any place name in Bangkok context using TomTom Search."""
-    query = f"{name} Bangkok Thailand"
-    url = f"{TOMTOM_BASE_URL}/search/2/search/{query}.json"
-    params = {
+    params_base = {
         "key": settings.TOMTOM_API_KEY,
         "limit": 1,
         "countrySet": "TH",
@@ -208,17 +206,107 @@ async def geocode_place(name: str) -> tuple:
         "lon": 100.5018,
         "radius": 50000,
     }
+    queries = [
+        f"{name} Bangkok",
+        f"{name} Bangkok Thailand",
+        name,
+    ]
     try:
         async with httpx.AsyncClient() as client:
-            r = await client.get(url, params=params, timeout=10)
+            for query in queries:
+                url = f"{TOMTOM_BASE_URL}/search/2/search/{query}.json"
+                r = await client.get(url, params=params_base, timeout=10)
+                if r.status_code == 200:
+                    results = r.json().get("results", [])
+                    if results:
+                        pos = results[0]["position"]
+                        print(f"[geocode] '{name}' → '{query}' → ({pos['lat']}, {pos['lon']})")
+                        return pos["lat"], pos["lon"]
+    except Exception as e:
+        print(f"[geocode] Error for '{name}': {e}")
+    # Fallback: try TomTom POI search (better for malls, landmarks, named places)
+    try:
+        async with httpx.AsyncClient() as client:
+            poi_url = f"{TOMTOM_BASE_URL}/search/2/poiSearch/{name}.json"
+            poi_params = {
+                "key": settings.TOMTOM_API_KEY,
+                "limit": 1,
+                "countrySet": "TH",
+                "lat": 13.7563,
+                "lon": 100.5018,
+                "radius": 50000,
+            }
+            r = await client.get(poi_url, params=poi_params, timeout=10)
             if r.status_code == 200:
                 results = r.json().get("results", [])
                 if results:
                     pos = results[0]["position"]
+                    print(f"[geocode] POI match for '{name}' → ({pos['lat']}, {pos['lon']})")
                     return pos["lat"], pos["lon"]
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[geocode] POI search error for '{name}': {e}")
+
+    print(f"[geocode] Could not geocode '{name}'")
     return None, None
+
+
+async def calculate_route_arrive_at(
+    from_lat: float, from_lon: float,
+    to_lat: float, to_lon: float,
+    arrive_at_iso: str,
+) -> dict | None:
+    """Call TomTom Routing with arriveAt to get recommended departure time.
+    arrive_at_iso: 'YYYY-MM-DDTHH:mm:ss' Bangkok local time.
+    Returns {depart_time_str, arrive_time_str, travel_time_mins, length_km} or None.
+    """
+    url = (
+        f"{TOMTOM_BASE_URL}/routing/1/calculateRoute"
+        f"/{from_lat},{from_lon}:{to_lat},{to_lon}/json"
+    )
+    params = {
+        "key": settings.TOMTOM_API_KEY,
+        "arriveAt": arrive_at_iso,
+        "travelMode": "car",
+        "routeType": "fastest",
+        "traffic": "true",
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, params=params, timeout=15)
+            if resp.status_code != 200:
+                print(f"[arriveAt] TomTom error {resp.status_code}: {resp.text[:200]}")
+                return None
+            data = resp.json()
+            route = data["routes"][0]
+            s = route["summary"]
+            depart_raw = s.get("departureTime", "")
+            arrive_raw = s.get("arrivalTime", "")
+
+            def fmt(iso: str) -> str:
+                # "2025-03-31T17:10:00+07:00" → "5:10 PM"
+                try:
+                    t = iso[11:16]  # "HH:MM"
+                    h, m = int(t[:2]), int(t[3:])
+                    meridiem = "AM" if h < 12 else "PM"
+                    h12 = h % 12 or 12
+                    return f"{h12}:{m:02d} {meridiem}"
+                except Exception:
+                    return iso
+
+            points = [
+                [p["latitude"], p["longitude"]]
+                for p in route["legs"][0]["points"]
+            ]
+            return {
+                "depart_time_str": fmt(depart_raw),
+                "arrive_time_str": fmt(arrive_raw),
+                "travel_time_mins": round(s["travelTimeInSeconds"] / 60),
+                "length_km": round(s["lengthInMeters"] / 1000, 1),
+                "route_points": points,
+            }
+    except Exception as e:
+        print(f"[arriveAt] Error: {e}")
+        return None
 
 
 async def calculate_route(

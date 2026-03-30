@@ -87,3 +87,15 @@ class QueryLog(Base):
     response = Column(Text)
     used_live_data = Column(String(5), default="false")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class TravelTimeLog(Base):
+    __tablename__ = "travel_time_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    dest_name = Column(String(255), nullable=False)   # normalized destination name
+    dest_lat = Column(Float, nullable=False)
+    dest_lng = Column(Float, nullable=False)
+    day_of_week = Column(Integer, nullable=False)     # 0=Monday … 6=Sunday
+    hour = Column(Integer, nullable=False)            # departure hour 0-23
+    travel_time_mins = Column(Integer, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
