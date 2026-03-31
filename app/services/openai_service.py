@@ -120,6 +120,26 @@ def get_active_incidents(db: Session, intent: str) -> str:
 
     return "\n".join(lines)
 
+def _get_answer_instruction(intent: str, route_instruction: str) -> str:
+    if route_instruction:
+        return route_instruction.strip()
+    if intent == "accident":
+        return (
+            "List each incident as a bullet point: type, location (if known), severity, and delay. "
+            "If no incidents are found, say so clearly. Do NOT use the 3-part structure."
+        )
+    if intent == "road_closures":
+        return (
+            "List each closure or blockage as a bullet point: road name, reason, and alternate route if available. "
+            "Do NOT use the 3-part structure."
+        )
+    if intent in ("congestion", "delays"):
+        return (
+            "List the most congested roads as bullet points with speed and congestion level. "
+            "End with one sentence of practical advice."
+        )
+    return "Answer following the 3-part structure: current condition, specific impact, specific recommendation."
+
 async def generate_answer(
     query: str,
     db: Session,
@@ -194,7 +214,7 @@ Detected intent: {intent}
 --- KNOWLEDGE BASE & FAQs ---
 {kb_context}
 
-Answer following the 3-part structure: current condition, specific impact, specific recommendation.{route_instruction}"""
+{_get_answer_instruction(intent, route_instruction)}"""
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",

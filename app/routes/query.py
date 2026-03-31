@@ -16,7 +16,7 @@ from app.services.traffic_service import (
     calculate_route,
     calculate_route_arrive_at,
 )
-from app.services.flow_sync import format_all_roads_flow, find_road_by_query, get_congested_roads
+from app.services.flow_sync import format_all_roads_flow, find_road_by_query, get_congested_roads, ROAD_FLOW_CACHE
 from app.models import QueryLog, Incident, TravelTimeLog
 from typing import Optional
 
@@ -31,6 +31,13 @@ _ROUTE_RE = re.compile(
 # "what abt to X", "what about to X", "get to X", "going to X", "head to X", "travel to X"
 _ROUTE_TO_RE = re.compile(
     r'(?:route|directions?|navigate|take me|go|get|going|head|travel|what\s+a(?:bt|bout)|how\s+(?:long|far|do\s+i\s+get))\s+to\s+(.+?)(?:\s+avoiding\s+(.+?))?(?:\s*[?!.])?$',
+    re.IGNORECASE,
+)
+
+# Matches "how long does it take to get to X", "how long to reach X", etc.
+# Uses greedy .* so it matches the LAST "to X" in the string (the actual destination)
+_HOW_LONG_RE = re.compile(
+    r'how\s+long\b.*\bto\s+([\w\s\'&\-]+?)(?:\s+avoiding\s+(.+?))?(?:\s*[?!.])?$',
     re.IGNORECASE,
 )
 
@@ -60,6 +67,16 @@ def _extract_route(question: str):
         dest  = m2.group(1).strip().rstrip('?.,!')
         avoid = m2.group(2).strip().rstrip('?.,!') if m2.group(2) else None
         if '[' not in dest:
+            return None, dest, avoid
+
+    # Try "how long does it take to get to X" patterns
+    m3 = _HOW_LONG_RE.search(question)
+    if m3:
+        dest  = m3.group(1).strip().rstrip('?.,!')
+        avoid = m3.group(2).strip().rstrip('?.,!') if m3.group(2) else None
+        # Strip leading motion verbs that may be captured (e.g. "reach", "get to", "go to")
+        dest = re.sub(r'^(?:get\s+to|go\s+to|reach|travel\s+to|arrive\s+at)\s+', '', dest, flags=re.IGNORECASE).strip()
+        if '[' not in dest and dest:
             return None, dest, avoid
 
     return None, None, None
@@ -258,6 +275,12 @@ async def query_traffic(
                     "Tap a road below to plan your route around it, or type "
                     "'Route from [origin] to [destination] avoiding [road name]'."
                 )
+        elif not ROAD_FLOW_CACHE:
+            answer = (
+                "Traffic data is still loading — please wait a moment and try again."
+                if (request.language or "en") != "th"
+                else "ข้อมูลการจราจรกำลังโหลด กรุณารอสักครู่แล้วลองใหม่"
+            )
         else:
             answer = (
                 "All major Bangkok roads are flowing freely right now — no significant congestion detected."
@@ -289,86 +312,84 @@ async def query_traffic(
 
         to_lat, to_lon = await geocode_place(destination)
 
-        if not from_lat or not to_lat:
-            if not from_lat and origin == "Your location":
-                answer = "I need your location to route from here. Please tap 'Use My Location' on the Map page first."
-            else:
-                failed = origin if not from_lat else destination
-                answer = (
-                    f"I couldn't locate '{failed}' in Bangkok. "
-                    "Please use a more specific place name (e.g. 'Siam BTS', 'Central World', 'On Nut')."
-                )
-            return QueryResponse(answer=answer, intent="route_conditions", used_live_data=False)
-
-        avoid_lat = avoid_lon = None
-        avoid_road_name = None
-        if avoid_road:
-            rname, rcoords = find_road_by_query(avoid_road)
-            if rcoords:
-                avoid_lat, avoid_lon = rcoords["lat"], rcoords["lon"]
-                avoid_road_name = rname.replace(" Bangkok", "") if rname else avoid_road
-
-        route_points, route_summary = await calculate_route(
-            from_lat, from_lon, to_lat, to_lon, avoid_lat, avoid_lon
-        )
-
-        if not route_points:
+        if not to_lat:
             return QueryResponse(
-                answer="Sorry, I couldn't calculate a route right now. Please try again.",
-                intent="route_conditions", used_live_data=False,
+                answer=f"I couldn't locate '{destination}' in Bangkok. Please use a more specific place name (e.g. 'Siam BTS', 'Central World', 'On Nut').",
+                intent="route_conditions", used_live_data=False
             )
 
-        # Log travel time for historical predictions
-        now = datetime.now(timezone.utc)
-        tlog = TravelTimeLog(
-            dest_name=destination.lower().strip(),
-            dest_lat=to_lat, dest_lng=to_lon,
-            day_of_week=now.weekday(), hour=now.hour,
-            travel_time_mins=route_summary["travel_time_mins"],
-        )
-        db.add(tlog)
+        if from_lat:
+            # Full route calculation
+            avoid_lat = avoid_lon = None
+            avoid_road_name = None
+            if avoid_road:
+                rname, rcoords = find_road_by_query(avoid_road)
+                if rcoords:
+                    avoid_lat, avoid_lon = rcoords["lat"], rcoords["lon"]
+                    avoid_road_name = rname.replace(" Bangkok", "") if rname else avoid_road
 
-        avoid_note = f"Avoiding: {avoid_road_name}" if avoid_road_name else "Using live traffic (fastest route)"
-        route_context = (
-            f"Route: {origin} → {destination}\n"
-            f"Distance: {route_summary['length_km']} km\n"
-            f"Travel time: {route_summary['travel_time_mins']} minutes\n"
-            f"Traffic delay: {route_summary['traffic_delay_mins']} minutes\n"
-            f"{avoid_note}"
-        )
+            route_points, route_summary = await calculate_route(
+                from_lat, from_lon, to_lat, to_lon, avoid_lat, avoid_lon
+            )
 
-        # Minimal live data for GPT context
-        try:
-            mid = len(route_points) // 2
-            inc_data = await get_traffic_incidents(route_points[mid][0], route_points[mid][1])
-        except Exception:
-            inc_data = {"incidents": []}
-        live_inc = format_incidents_for_context(inc_data)
+            if not route_points:
+                return QueryResponse(
+                    answer="Sorry, I couldn't calculate a route right now. Please try again.",
+                    intent="route_conditions", used_live_data=False,
+                )
 
-        result = await generate_answer(
-            query=request.question, db=db,
-            live_incidents=live_inc, live_flow="",
-            language=request.language or "en",
-            route_context=route_context,
-        )
+            now = datetime.now(timezone.utc)
+            tlog = TravelTimeLog(
+                dest_name=destination.lower().strip(),
+                dest_lat=to_lat, dest_lng=to_lon,
+                day_of_week=now.weekday(), hour=now.hour,
+                travel_time_mins=route_summary["travel_time_mins"],
+            )
+            db.add(tlog)
 
-        log = QueryLog(
-            user_query=request.question, intent="route_conditions",
-            response=result["answer"], used_live_data="true"
-        )
-        db.add(log); db.commit()
+            avoid_note = f"Avoiding: {avoid_road_name}" if avoid_road_name else "Using live traffic (fastest route)"
+            route_context = (
+                f"Route: {origin} → {destination}\n"
+                f"Distance: {route_summary['length_km']} km\n"
+                f"Travel time: {route_summary['travel_time_mins']} minutes\n"
+                f"Traffic delay: {route_summary['traffic_delay_mins']} minutes\n"
+                f"{avoid_note}"
+            )
 
-        mid_idx = len(route_points) // 2
-        return QueryResponse(
-            answer=result["answer"],
-            intent="route_conditions",
-            used_live_data=True,
-            sources=[],
-            focus_lat=route_points[mid_idx][0],
-            focus_lng=route_points[mid_idx][1],
-            route_points=route_points,
-            route_summary=route_summary,
-        )
+            try:
+                mid = len(route_points) // 2
+                inc_data = await get_traffic_incidents(route_points[mid][0], route_points[mid][1])
+            except Exception:
+                inc_data = {"incidents": []}
+            live_inc = format_incidents_for_context(inc_data)
+
+            result = await generate_answer(
+                query=request.question, db=db,
+                live_incidents=live_inc, live_flow="",
+                language=request.language or "en",
+                route_context=route_context,
+            )
+
+            log = QueryLog(
+                user_query=request.question, intent="route_conditions",
+                response=result["answer"], used_live_data="true"
+            )
+            db.add(log); db.commit()
+
+            mid_idx = len(route_points) // 2
+            return QueryResponse(
+                answer=result["answer"],
+                intent="route_conditions",
+                used_live_data=True,
+                sources=[],
+                focus_lat=route_points[mid_idx][0],
+                focus_lng=route_points[mid_idx][1],
+                route_points=route_points,
+                route_summary=route_summary,
+            )
+        else:
+            # No GPS origin — answer traffic question for the destination area instead
+            lat, lon = to_lat, to_lon
 
     # ── 3. Normal traffic query ────────────────────────────────────────────────
     is_generic = False
@@ -387,14 +408,20 @@ async def query_traffic(
                 lat, lon = geo_lat, geo_lon
                 print(f"[query] Geocoded '{request.question}' → ({lat}, {lon})")
             else:
-                lat, lon = DEFAULT_LAT, DEFAULT_LON
-                is_generic = True
-                print(f"[query] No road found in query, using all-roads overview")
-                # Flag that the specific road in the query wasn't found
-                request.question = request.question + "\n\n[SYSTEM NOTE: The road/location mentioned above was NOT found in the Bangkok traffic database. Do not use any road name from the user's question. If asked about a specific road, say it was not found in the system.]"
+                # Fall back to full TomTom geocode before treating as generic
+                geo_lat, geo_lon = await geocode_place(request.question)
+                if geo_lat and geo_lon:
+                    lat, lon = geo_lat, geo_lon
+                    print(f"[query] geocode_place fallback '{request.question}' → ({lat}, {lon})")
+                else:
+                    lat, lon = DEFAULT_LAT, DEFAULT_LON
+                    is_generic = True
+                    print(f"[query] No road found in query, using all-roads overview")
+                    # Flag that the specific road in the query wasn't found
+                    request.question = request.question + "\n\n[SYSTEM NOTE: The road/location mentioned above was NOT found in the Bangkok traffic database. Do not use any road name from the user's question. If asked about a specific road, say it was not found in the system.]"
 
     try:
-        incidents_data = await get_traffic_incidents(lat, lon)
+        incidents_data = await get_traffic_incidents(lat, lon, wide=is_generic)
     except Exception:
         incidents_data = {"incidents": []}
     try:

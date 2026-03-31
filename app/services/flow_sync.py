@@ -201,7 +201,7 @@ async def run_flow_sync_loop():
         finally:
             db.close()
 
-        await asyncio.sleep(1800)  # 30 minutes
+        await asyncio.sleep(300)  # 5 minutes
 
 
 def format_all_roads_flow() -> str:

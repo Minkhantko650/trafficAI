@@ -91,11 +91,13 @@ DELAY_SEVERITY = {
     4: "undefined delay"
 }
 
-async def get_traffic_incidents(lat: float, lon: float, radius: int = 5000):
+async def get_traffic_incidents(lat: float, lon: float, radius: int = 5000, wide: bool = False):
     url = f"{TOMTOM_BASE_URL}/traffic/services/5/incidentDetails"
+    # wide=True covers all of Bangkok metro (~30km radius) for general queries
+    delta = 0.27 if wide else 0.05
     params = {
         "key": settings.TOMTOM_API_KEY,
-        "bbox": f"{lon-0.05},{lat-0.05},{lon+0.05},{lat+0.05}",
+        "bbox": f"{lon-delta},{lat-delta},{lon+delta},{lat+delta}",
         "fields": "{incidents{type,geometry{type,coordinates},properties{id,iconCategory,magnitudeOfDelay,events{description,code,iconCategory},startTime,endTime,from,to,length,delay,roadNumbers,timeValidity}}}",
         "language": "en-GB",
         "timeValidityFilter": "present"
@@ -161,40 +163,91 @@ def get_first_incident_coords(incidents_data: dict) -> tuple:
     return None, None
 
 
+ICON_CATEGORY_LABEL = {
+    0: "Incident",
+    1: "Accident",
+    2: "Fog",
+    3: "Dangerous Conditions",
+    4: "Rain",
+    5: "Ice",
+    6: "Traffic Jam",
+    7: "Lane Closed",
+    8: "Road Closed",
+    9: "Road Works",
+    10: "High Winds",
+    11: "Flooding",
+    14: "Broken Down Vehicle",
+}
+
+def _is_useful_location(text: str) -> bool:
+    """Return False if text is empty, purely numeric, a short code, or a highway number pattern."""
+    if not text or not text.strip():
+        return False
+    cleaned = text.strip()
+    # Purely numeric (e.g. "307", "6") or very short (e.g. "A", "B1")
+    if re.match(r'^[\d\s\-/]+$', cleaned):
+        return False
+    if len(cleaned) <= 2:
+        return False
+    # Highway/route number patterns: "Road 31", "Route 9", "Highway 1", "AH1", "TH-31"
+    if re.match(r'^(?:road|route|highway|hwy|rd|no\.?|th[-\s]?|ah)\s*\d+$', cleaned, re.IGNORECASE):
+        return False
+    # Just a number with a suffix like "31N", "2A"
+    if re.match(r'^\d+[a-z]?$', cleaned, re.IGNORECASE):
+        return False
+    return True
+
 def format_incidents_for_context(incidents_data: dict) -> str:
     incidents = incidents_data.get("incidents", [])
     if not incidents:
         return "No active traffic incidents reported in this area."
 
+    # Sort by magnitudeOfDelay descending (most severe first)
+    incidents = sorted(
+        incidents,
+        key=lambda i: i.get("properties", {}).get("magnitudeOfDelay", 0),
+        reverse=True
+    )
+
     lines = []
     for inc in incidents[:5]:
         props = inc.get("properties", {})
         events = props.get("events", [{}])
-        raw_desc = events[0].get("description", "Unknown incident") if events else "Unknown incident"
-        description = strip_thai(raw_desc) or raw_desc
-        from_loc = strip_thai(props.get("from", "Unknown location")) or props.get("from", "Unknown location")
-        to_loc = strip_thai(props.get("to", ""))
-        road_numbers = props.get("roadNumbers", [])
         delay = props.get("delay", 0)
         magnitude = props.get("magnitudeOfDelay", 0)
+        icon_cat = props.get("iconCategory", 0)
+        if events:
+            icon_cat = events[0].get("iconCategory", icon_cat)
 
-        # Specific delay time
+        incident_type = ICON_CATEGORY_LABEL.get(icon_cat, "Incident")
+        severity_text = DELAY_SEVERITY.get(magnitude, "unknown severity")
         delay_min = round(delay / 60) if delay else 0
         delay_text = f"{delay_min} min delay" if delay_min > 0 else "no significant delay"
 
-        # Severity from magnitudeOfDelay
-        severity_text = DELAY_SEVERITY.get(magnitude, "unknown severity")
+        # Try to get a human-readable location
+        raw_from = props.get("from", "")
+        raw_to   = props.get("to", "")
+        clean_from = strip_thai(raw_from).strip() if raw_from else ""
+        clean_to   = strip_thai(raw_to).strip()   if raw_to   else ""
 
-        # Road name
-        road_text = f" on {', '.join(road_numbers)}" if road_numbers else ""
-        route_text = f" from {from_loc} to {to_loc}" if to_loc else f" near {from_loc}"
+        # Prefer cleaned text; fall back to original if Thai stripping left something readable
+        from_loc = clean_from if _is_useful_location(clean_from) else (raw_from if _is_useful_location(raw_from) else "")
+        to_loc   = clean_to   if _is_useful_location(clean_to)   else (raw_to   if _is_useful_location(raw_to)   else "")
+
+        # Build location string — only include from/to if they look like real place names
+        if from_loc and to_loc:
+            location_text = f" between {from_loc} and {to_loc}"
+        elif from_loc:
+            location_text = f" near {from_loc}"
+        else:
+            location_text = ""
 
         lines.append(
-            f"- {description}{road_text}{route_text}. "
+            f"- {incident_type}{location_text}. "
             f"Severity: {severity_text}. Delay: {delay_text}."
         )
 
-    return "\n".join(lines)
+    return "\n".join(lines) if lines else "No active traffic incidents reported in this area."
 
 async def geocode_place(name: str) -> tuple:
     """Geocode any place name in Bangkok context using TomTom Search."""
