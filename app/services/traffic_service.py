@@ -231,8 +231,8 @@ def format_incidents_for_context(incidents_data: dict) -> str:
         clean_to   = strip_thai(raw_to).strip()   if raw_to   else ""
 
         # Prefer cleaned text; fall back to original if Thai stripping left something readable
-        from_loc = clean_from if _is_useful_location(clean_from) else (raw_from if _is_useful_location(raw_from) else "")
-        to_loc   = clean_to   if _is_useful_location(clean_to)   else (raw_to   if _is_useful_location(raw_to)   else "")
+        from_loc = clean_from if _is_useful_location(clean_from) else ""
+        to_loc   = clean_to   if _is_useful_location(clean_to)   else ""
 
         # Build location string — only include from/to if they look like real place names
         if from_loc and to_loc:

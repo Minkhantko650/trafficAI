@@ -109,7 +109,8 @@ def get_active_incidents(db: Session, intent: str) -> str:
 
     lines = []
     for inc in sorted_incidents:
-        line = f"- [{inc.severity.upper()}] {inc.type} on {inc.location}: {inc.description}"
+        display_location = inc.location_en or inc.location
+        line = f"- [{inc.severity.upper()}] {inc.type} on {display_location}: {inc.description}"
         if inc.affected_roads:
             line += f" Affected roads: {inc.affected_roads}."
         if inc.estimated_clearance:
